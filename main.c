@@ -58,9 +58,13 @@
 #include "bsp_btn_ble.h"
 #include "nrf_pwr_mgmt.h"
 
-#include "crc32.h"
+#include "crc16.h"
 #include "fds.h"
-#include "fds_example.h"
+#include "fds_record.h"
+
+#include "nrf_delay.h"
+#include "nrf_gpio.h"
+#include "nrf_drv_spi.h"
 
 #if defined (UART_PRESENT)
 #include "nrf_uart.h"
@@ -79,7 +83,6 @@
 #define NUS_SERVICE_UUID_TYPE           BLE_UUID_TYPE_VENDOR_BEGIN                  /**< UUID type for the Nordic UART Service (vendor specific). */
 
 #define APP_BLE_OBSERVER_PRIO           3                                           /**< Application's BLE observer priority. You shouldn't need to modify this value. */
-
 #define APP_ADV_INTERVAL                64                                          /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
 
 #define APP_ADV_DURATION                18000                                       /**< The advertising duration (180 seconds) in units of 10 milliseconds. */
@@ -147,9 +150,9 @@ static struct
 } m_delete_all;
 
 static void fds_evt_handler(fds_evt_t const * p_evt) {
-    printf("Event: %s received (%s)\n",
+    /*printf("Event: %s received (%s)\n",
                   fds_evt_str[p_evt->id],
-                  fds_err_str[p_evt->result]);
+                  fds_err_str[p_evt->result]);*/
 
     switch (p_evt->id) {
         case FDS_EVT_INIT:
@@ -162,9 +165,9 @@ static void fds_evt_handler(fds_evt_t const * p_evt) {
         case FDS_EVT_WRITE:
         {
             if (p_evt->result == FDS_SUCCESS) {
-                NRF_LOG_INFO("Record ID:\t0x%04x",  p_evt->write.record_id);
-                NRF_LOG_INFO("File ID:\t0x%04x",    p_evt->write.file_id);
-                NRF_LOG_INFO("Record key:\t0x%04x", p_evt->write.record_key);
+                /*printf("Record ID:\t0x%04x\n",  p_evt->write.record_id);
+                printf("File ID:\t0x%04x\n",    p_evt->write.file_id);
+                printf("Record key:\t0x%04x\n", p_evt->write.record_key);*/
             }
         } break;
 
@@ -198,13 +201,10 @@ bool record_delete_next(void) {
     fds_find_token_t  tok   = {0};
     fds_record_desc_t desc  = {0};
 
-    if (fds_record_iterate(&desc, &tok) == FDS_SUCCESS)
-    {
+    if (fds_record_iterate(&desc, &tok) == FDS_SUCCESS) {
         ret_code_t rc = fds_record_delete(&desc);
         if (rc != FDS_SUCCESS)
-        {
-            return false;
-        }
+            return false; 
 
         return true;
     } else {
@@ -212,28 +212,23 @@ bool record_delete_next(void) {
         return false;
     }
 }
-void delete_all_begin(void) {
-    m_delete_all.delete_next = true;
-}
 void delete_all_process(void){
-    if (   m_delete_all.delete_next
-        & !m_delete_all.pending)
-    {
+    if (   true
+        & !m_delete_all.pending) {
         NRF_LOG_INFO("Deleting next record.");
 
         m_delete_all.delete_next = record_delete_next();
         if (!m_delete_all.delete_next)
-        {
-            NRF_LOG_CYAN("No records left to delete.");
-        }
+            NRF_LOG_INFO("No records left to delete.");
+        
     }
 }
 //######################################################################################################### set config file
 static configuration_t m_dummy_cfg =
 {
-    .timestamp = 0,
-    .data1 = 1,
-    .crc = 0,
+    .timestamp = 0x0,
+    .data1 = 0x55,
+    .crc = 0x11,
 };
 
 static fds_record_t const m_dummy_record =
@@ -244,19 +239,14 @@ static fds_record_t const m_dummy_record =
     .data.length_words = (sizeof(m_dummy_cfg) + 3) / sizeof(uint32_t),
 };
 
-static fds_record_t const save_record =
-{
-    .file_id           = 0x0,
-    .key               = 0x0,
-    .data.p_data       = &m_dummy_cfg,
-    .data.length_words = (sizeof(m_dummy_cfg) + 3) / sizeof(uint32_t),
-};
-
-
 //######################################################################################################### init fileID and key
 uint32_t timestamp = 0;
-uint16_t fileID = 0x0010;
-uint16_t key = 0x0010;
+uint16_t fileID = 0x01;
+uint16_t key = 0x01;
+
+int delay = 0; // After
+
+bool delete_all_data = false;
 //######################################################################################################### send data
 uint32_t send_ble(unsigned char data_arr[]) {
     uint16_t length = (uint16_t)strlen(data_arr);
@@ -335,8 +325,7 @@ static void nus_data_handler(ble_nus_evt_t * p_evt) {
 
         ret_code_t rc = fds_record_find(CONFIG_FILE, CONFIG_REC_KEY, &desc, &tok);
 
-        if (rc == FDS_SUCCESS)
-        {
+        if (rc == FDS_SUCCESS) {
             fds_flash_record_t config = {0};
 
             rc = fds_record_open(&desc, &config);
@@ -344,8 +333,7 @@ static void nus_data_handler(ble_nus_evt_t * p_evt) {
 
             memcpy(&m_dummy_cfg, config.p_data, sizeof(configuration_t));
 
-            printf("Timestamp received, updating Timestamp to %d\n", timestamp);
-
+            printf("Timestamp received, updating Timestamp to \t0x%04x\n", timestamp);
             m_dummy_cfg.timestamp = timestamp;
 
             rc = fds_record_close(&desc);
@@ -356,28 +344,9 @@ static void nus_data_handler(ble_nus_evt_t * p_evt) {
 
             unsigned char data_arr[] = "Timestamp recieved, updating config file";
             send_ble(data_arr);
+        } else {
+            printf("Timestamp was not found\n");
         }
-
-        NRF_LOG_DEBUG("Received data from BLE NUS. Writing data on UART.");
-        NRF_LOG_HEXDUMP_DEBUG(p_evt->params.rx_data.p_data, p_evt->params.rx_data.length);
-
-        /*for (uint32_t i = 0; i < p_evt->params.rx_data.length; i++)
-        {
-            uint32_t err_code;
-            do
-            {
-                err_code = app_uart_put(p_evt->params.rx_data.p_data[i]);
-                if ((err_code != NRF_SUCCESS) && (err_code != NRF_ERROR_BUSY))
-                {
-                    NRF_LOG_ERROR("Failed receiving NUS message. Error 0x%x. ", err_code);
-                    APP_ERROR_CHECK(err_code);
-                }
-            } while (err_code == NRF_ERROR_BUSY);
-        }
-        if (p_evt->params.rx_data.p_data[p_evt->params.rx_data.length - 1] == '\r')
-        {
-            while (app_uart_put('\n') == NRF_ERROR_BUSY);
-        }*/
     }
 
 }
@@ -625,9 +594,7 @@ void bsp_event_handler(bsp_event_t event) {
             if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
                 err_code = ble_advertising_restart_without_whitelist(&m_advertising);
                 if (err_code != NRF_ERROR_INVALID_STATE)
-                {
                     APP_ERROR_CHECK(err_code);
-                }
             }
             break;
 
@@ -636,18 +603,19 @@ void bsp_event_handler(bsp_event_t event) {
     }
 }
 //######################################################################################################################### NEW DATA
-void newDataInFile (uint32_t timestamp,
+configuration_t newDataInFile (uint32_t timestamp,
                     uint32_t data1) {
-  m_dummy_cfg.timestamp = timestamp;
-  m_dummy_cfg.data1 = data1;
-  m_dummy_cfg.crc = 0x0;//crc32_compute();
+  configuration_t data =
+{
+    .timestamp = timestamp,
+    .data1 = data1,
+    .crc = 0x0, //crc32_compute(
+};
+  return data;
 }
 //######################################################################################################################### WRITE FSD
-void static write_fds (configuration_t * p_data) {
-
-  fileID++;
-  key++;
-
+void static write_fds (void const * p_data) {
+  fds_record_desc_t desc = {0};
   fds_record_t const rec =
     {
         .file_id           = fileID,
@@ -655,44 +623,51 @@ void static write_fds (configuration_t * p_data) {
         .data.p_data       = p_data,
         .data.length_words = (sizeof(configuration_t) + 3) / sizeof(uint32_t),
     };
-  printf("WRITE: key: %u, data: %u\n", key, &rec.data);
-  ret_code_t rc = fds_record_write(NULL, &rec);
-  APP_ERROR_CHECK(rc);
-   
+  if (key != FDS_RECORD_KEY_DIRTY && fileID != FDS_FILE_ID_INVALID) {
+    configuration_t * p_cfg = (configuration_t *)(p_data);
+    printf("W Key:\t0x%04x,data:\t0x%04x T:\t0x%04x, 1:\t0x%04x, c:\t0x%04x\n\n", key, &rec.data.p_data, p_cfg->timestamp, p_cfg->data1, p_cfg->crc);
+    ret_code_t rc = fds_record_write(&desc, &rec);
+    APP_ERROR_CHECK(rc);
+
+    if (rc != FDS_SUCCESS){
+      bsp_board_led_on(BSP_BOARD_LED_3);
+    } else {
+      key++;
+    }
+  }
+
 }
 //######################################################################################################### get_data from FDS
-configuration_t * get_cfg(uint16_t file_id, uint16_t record_key) {
+void get_all_data(uint16_t file_id) {
     fds_record_desc_t desc = {0};
     fds_find_token_t  tok  = {0};
-
+    printf("FOUND\n");
     while (fds_record_iterate(&desc, &tok) != FDS_ERR_NOT_FOUND) {
 
         fds_flash_record_t record = {0};
-
         ret_code_t rc = fds_record_open(&desc, &record);
-        APP_ERROR_CHECK(rc);
 
-        configuration_t * p_cfg = (configuration_t *)(record.p_data);
-        printf("KEY: %u DATA: %u, %u, %u\n",record.p_header->record_key, p_cfg->timestamp, p_cfg->data1, p_cfg->crc);
-        rc = fds_record_close(&desc);
-        APP_ERROR_CHECK(rc);
-    
-        //return p_cfg;
+        if (rc == FDS_SUCCESS){
+
+          configuration_t * p_cfg = (configuration_t *)(record.p_data);
+          uint32_t const len = record.p_header->length_words * sizeof(uint32_t);
+          printf("KEY:\t0x%04x DATA:\t0x%04x T:\t0x%04x, 1:\t0x%04x, c:\t0x%04x\n\n",
+          record.p_header->record_key,record.p_data, p_cfg->timestamp, p_cfg->data1, p_cfg->crc);
+       
+          rc = fds_record_close(&desc);
+          APP_ERROR_CHECK(rc);
+          p_cfg = NULL;
+          nrf_delay_ms(50);
+        }
     }
-    configuration_t * dummy;
-    dummy->timestamp = timestamp;
-    dummy->data1 = 0x0550;
-    dummy->crc = 0x0000;//crc32_compute();
-    return dummy;
 }
 //######################################################################################################################### UART SEND
 void uart_event_handle(app_uart_evt_t * p_event) {
     static uint8_t send_array[BLE_NUS_MAX_DATA_LEN];
     static uint8_t index = 0;
     uint32_t       err_code;
-    unsigned char data_arr[] = "Hello world!\n";
-    switch (p_event->evt_type)
-    {
+    unsigned char data_arr[] = "";
+    switch (p_event->evt_type) {
         case APP_UART_DATA_READY:
             UNUSED_VARIABLE(app_uart_get(&send_array[index]));
             index++;
@@ -700,20 +675,17 @@ void uart_event_handle(app_uart_evt_t * p_event) {
             if ((send_array[index - 1] == '\n') || (index >= m_ble_nus_max_data_len)) {
               if (index > 1) {
                 do {
-                  send_array[--index] = 0;
-                  char * num_char = (char *) send_array;
-                  uint32_t  num = atoi(num_char);
                   if (timestamp != 0) {
+                    send_array[--index] = 0;
+                    char * num_char = (char *) send_array;
+                    uint32_t  num = atoi(num_char);
 
-                    newDataInFile(timestamp, num);
-                    write_fds(&m_dummy_cfg);
-                    configuration_t * config_data = (configuration_t *)get_cfg(fileID, key);
-                    memcpy(&m_dummy_cfg, config_data, sizeof(configuration_t));
-                    uint32_t data1 = m_dummy_cfg.data1;
+                    configuration_t newData = newDataInFile(timestamp, num);
+                    write_fds(&newData);
+                    get_all_data(fileID);
+
+                    uint32_t data1 = newData.data1;
                     sprintf(data_arr, "%d", data1);
-                    /*if (num != data1) {
-                        strcpy(data_arr,"Wrong data");
-                    }*/
                   } else {
                     strcpy(data_arr,"No timestamp");
                   }
@@ -768,8 +740,7 @@ static void uart_init(void) {
 
 /**@brief Function for initializing the Advertising functionality.
  */
-static void advertising_init(void)
-{
+static void advertising_init(void) {
     uint32_t               err_code;
     ble_advertising_init_t init;
 
@@ -798,8 +769,7 @@ static void advertising_init(void)
  *
  * @param[out] p_erase_bonds  Will be true if the clear bonding button was pressed to wake the application up.
  */
-static void buttons_leds_init(bool * p_erase_bonds)
-{
+static void buttons_leds_init(bool * p_erase_bonds) {
     bsp_event_t startup_event;
 
     uint32_t err_code = bsp_init(BSP_INIT_LEDS | BSP_INIT_BUTTONS, bsp_event_handler);
@@ -873,9 +843,7 @@ int main(void)
     advertising_init();
     conn_params_init();
 
-    // Start execution.
-    printf("\r\nProject started.\r\n");
-
+    printf("\n");
     (void) fds_register(fds_evt_handler);
     rc = fds_init();
     APP_ERROR_CHECK(rc);
@@ -883,53 +851,48 @@ int main(void)
     /* Wait for fds to initialize. */
     wait_for_fds_ready();
 
-    delete_all_begin();
-    delete_all_process();
+    if (delete_all_data) {
+        delete_all_process();
+    }
 
     fds_stat_t stat = {0};
     rc = fds_stat(&stat);
     APP_ERROR_CHECK(rc);
 
     printf("Found %d valid records\n", stat.valid_records);
-    printf("Found %d dirty records (ready to be garbage collected)\n", stat.dirty_records);
+    //printf("Found %d dirty records\n", stat.dirty_records);
 
     if (stat.dirty_records > 0)
       fds_gc();
     
-    key += stat.valid_records;
-    fileID += stat.valid_records;
+    key += stat.valid_records - 1;
+
     fds_record_desc_t desc = {0};
     fds_find_token_t  tok  = {0};
 
+    get_all_data(fileID);
+
     if (fds_record_find(CONFIG_FILE, CONFIG_REC_KEY, &desc, &tok) == FDS_SUCCESS) {
         fds_flash_record_t config = {0};
-
         rc = fds_record_open(&desc, &config);
         APP_ERROR_CHECK(rc);
 
         memcpy(&m_dummy_cfg, config.p_data, sizeof(configuration_t));
-        printf("Config file found, Timestamp: %d. Updating crc: %d\n", m_dummy_cfg.timestamp, m_dummy_cfg.crc);
-
-        m_dummy_cfg.crc++;
+        timestamp = m_dummy_cfg.timestamp;
+        printf("Config file found, Timestamp: %d. Updated crc: %d\n", m_dummy_cfg.timestamp, ++m_dummy_cfg.crc);
 
         rc = fds_record_close(&desc);
         APP_ERROR_CHECK(rc);
-
         rc = fds_record_update(&desc, &m_dummy_record);
         APP_ERROR_CHECK(rc);
-    }
-    else {
-
-        printf("Writing config file...");
-
+    } else {
+        printf("Writing config file...\n");
         rc = fds_record_write(&desc, &m_dummy_record);
         APP_ERROR_CHECK(rc);
     }
     advertising_start();
 
-    // Enter main loop.
-    for (;;)
-    {
+    for (;;) {
         idle_state_handle();
     }
 }
