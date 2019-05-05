@@ -1,41 +1,7 @@
 /**
- * Copyright (c) 2014 - 2018, Nordic Semiconductor ASA
+ * Copyright (c) 2019, Tomas Hodor
  *
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without modification,
- * are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form, except as embedded into a Nordic
- *    Semiconductor ASA integrated circuit in a product or a software update for
- *    such product, must reproduce the above copyright notice, this list of
- *    conditions and the following disclaimer in the documentation and/or other
- *    materials provided with the distribution.
- *
- * 3. Neither the name of Nordic Semiconductor ASA nor the names of its
- *    contributors may be used to endorse or promote products derived from this
- *    software without specific prior written permission.
- *
- * 4. This software, with or without modification, must only be used with a
- *    Nordic Semiconductor ASA integrated circuit.
- *
- * 5. Any software provided in binary form under this license must not be reverse
- *    engineered, decompiled, modified and/or disassembled.
- *
- * THIS SOFTWARE IS PROVIDED BY NORDIC SEMICONDUCTOR ASA "AS IS" AND ANY EXPRESS
- * OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- * OF MERCHANTABILITY, NONINFRINGEMENT, AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL NORDIC SEMICONDUCTOR ASA OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
- * GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
- * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
+ * Help by NORDIC SEMICONDUCTOR, provided libraries and drivers for 
  */
 
 #include <stdint.h>
@@ -61,10 +27,13 @@
 #include "crc16.h"
 #include "fds.h"
 #include "fds_record.h"
+#include "bp_library.h"
 
 #include "nrf_delay.h"
 #include "nrf_gpio.h"
 #include "nrf_drv_spi.h"
+
+#include "nrf_drv_timer.h"
 
 #if defined (UART_PRESENT)
 #include "nrf_uart.h"
@@ -112,36 +81,16 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 {
     {BLE_UUID_NUS_SERVICE, NUS_SERVICE_UUID_TYPE}
 };
-//######################################################################################################### FDS
-char const * fds_err_str[] =
-{
-    "FDS_SUCCESS",
-    "FDS_ERR_OPERATION_TIMEOUT",
-    "FDS_ERR_NOT_INITIALIZED",
-    "FDS_ERR_UNALIGNED_ADDR",
-    "FDS_ERR_INVALID_ARG",
-    "FDS_ERR_NULL_ARG",
-    "FDS_ERR_NO_OPEN_RECORDS",
-    "FDS_ERR_NO_SPACE_IN_FLASH",
-    "FDS_ERR_NO_SPACE_IN_QUEUES",
-    "FDS_ERR_RECORD_TOO_LARGE",
-    "FDS_ERR_NOT_FOUND",
-    "FDS_ERR_NO_PAGES",
-    "FDS_ERR_USER_LIMIT_REACHED",
-    "FDS_ERR_CRC_CHECK_FAILED",
-    "FDS_ERR_BUSY",
-    "FDS_ERR_INTERNAL",
-};
-static char const * fds_evt_str[] =
-{
-    "FDS_EVT_INIT",
-    "FDS_EVT_WRITE",
-    "FDS_EVT_UPDATE",
-    "FDS_EVT_DEL_RECORD",
-    "FDS_EVT_DEL_FILE",
-    "FDS_EVT_GC",
-};
+//######################################################################################################### SPI
+#define SPI_INSTANCE                    0                                           /**< SPI instance index. */
+static const nrf_drv_spi_t spi = NRF_DRV_SPI_INSTANCE(SPI_INSTANCE);                /**< SPI instance. */
+static volatile bool spi_xfer_done;                                                 /**< Flag used to indicate that SPI instance completed the transfer. */
 
+static uint8_t       m_tx_buf[] = {0x00,0xFF,0xFF,0xFF,0xFF};                       /**< TX buffer. */
+static uint8_t       m_rx_buf[sizeof(m_tx_buf)];                                  /**< RX buffer. */
+static const uint8_t m_length = sizeof(m_tx_buf);                                   /**< Transfer length. */
+
+//######################################################################################################### FDS
 static bool volatile m_fds_initialized;
 static struct
 {
@@ -150,14 +99,9 @@ static struct
 } m_delete_all;
 
 static void fds_evt_handler(fds_evt_t const * p_evt) {
-    /*printf("Event: %s received (%s)\n",
-                  fds_evt_str[p_evt->id],
-                  fds_err_str[p_evt->result]);*/
-
     switch (p_evt->id) {
         case FDS_EVT_INIT:
-            if (p_evt->result == FDS_SUCCESS)
-            {
+            if (p_evt->result == FDS_SUCCESS) {
                 m_fds_initialized = true;
             }
             break;
@@ -165,9 +109,9 @@ static void fds_evt_handler(fds_evt_t const * p_evt) {
         case FDS_EVT_WRITE:
         {
             if (p_evt->result == FDS_SUCCESS) {
-                /*printf("Record ID:\t0x%04x\n",  p_evt->write.record_id);
-                printf("File ID:\t0x%04x\n",    p_evt->write.file_id);
-                printf("Record key:\t0x%04x\n", p_evt->write.record_key);*/
+                NRF_LOG_INFO("Record ID:\t0x%04x\n",  p_evt->write.record_id);
+                NRF_LOG_INFO("File ID:\t0x%04x\n",    p_evt->write.file_id);
+                NRF_LOG_INFO("Record key:\t0x%04x\n", p_evt->write.record_key);
             }
         } break;
 
@@ -197,6 +141,7 @@ static void wait_for_fds_ready(void) {
         power_manage();
     }
 }
+
 bool record_delete_next(void) {
     fds_find_token_t  tok   = {0};
     fds_record_desc_t desc  = {0};
@@ -227,6 +172,10 @@ void delete_all_process(void){
 static configuration_t m_dummy_cfg =
 {
     .timestamp = 0x0,
+    .sign_active_power = 0x0,
+    .sign_reactive_power = 0x0,
+    .overflow_active_energy = 0x0,
+    .overflow_reactive_energy = 0x0,
     .data1 = 0x55,
     .crc = 0x11,
 };
@@ -238,48 +187,46 @@ static fds_record_t const m_dummy_record =
     .data.p_data       = &m_dummy_cfg,
     .data.length_words = (sizeof(m_dummy_cfg) + 3) / sizeof(uint32_t),
 };
-
 //######################################################################################################### init fileID and key
+/**@brief timestamp for data, by default start at 0 */
 uint32_t timestamp = 0;
+/**@brief fileID for NFS, by default start at 1 */
 uint16_t fileID = 0x01;
+/**@brief Key for NFS, by default start at 1 */
 uint16_t key = 0x01;
-
-int delay = 0; // After
+/**@brief Delay of reading data, by default is 5 seconds */
+int delay = 5; 
 
 bool delete_all_data = false;
 //######################################################################################################### send data
+/**@brief Function for sending strings from BLE */
 uint32_t send_ble(unsigned char data_arr[]) {
+    uint32_t err_code;
     uint16_t length = (uint16_t)strlen(data_arr);
-    uint32_t err_code = ble_nus_data_send(&m_nus, data_arr, &length, m_conn_handle);
+    do {
+        err_code = ble_nus_data_send(&m_nus, data_arr, &length, m_conn_handle);
 
-    if ((err_code != NRF_ERROR_INVALID_STATE) &&
-        (err_code != NRF_ERROR_RESOURCES) &&
-        (err_code != NRF_ERROR_NOT_FOUND)) {
-        APP_ERROR_CHECK(err_code);
-    }
+        if ((err_code != NRF_ERROR_INVALID_STATE) &&
+            (err_code != NRF_ERROR_RESOURCES) &&
+            (err_code != NRF_ERROR_NOT_FOUND)) {
+            APP_ERROR_CHECK(err_code);
+        }
+    } while (err_code == NRF_ERROR_BUSY);
+    printf("%s - sended\n",data_arr);
     return err_code;
 }
-
-void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
-{
+/** NRF Default function */
+void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name) {
     app_error_handler(DEAD_BEEF, line_num, p_file_name);
 }
-
-/**@brief Function for initializing the timer module.
- */
+/** NRF Default function */
 static void timers_init(void)
 {
     ret_code_t err_code = app_timer_init();
     APP_ERROR_CHECK(err_code);
 }
-
-/**@brief Function for the GAP initialization.
- *
- * @details This function will set up all the necessary GAP (Generic Access Profile) parameters of
- *          the device. It also sets the permissions and appearance.
- */
-static void gap_params_init(void)
-{
+/** NRF Default function */
+static void gap_params_init(void) {
     uint32_t                err_code;
     ble_gap_conn_params_t   gap_conn_params;
     ble_gap_conn_sec_mode_t sec_mode;
@@ -301,95 +248,132 @@ static void gap_params_init(void)
     err_code = sd_ble_gap_ppcp_set(&gap_conn_params);
     APP_ERROR_CHECK(err_code);
 }
-
-
-/**@brief Function for handling Queued Write Module errors.
- *
- * @details A pointer to this function will be passed to each service which may need to inform the
- *          application about an error.
- *
- * @param[in]   nrf_error   Error code containing information about what went wrong.
- */
-static void nrf_qwr_error_handler(uint32_t nrf_error)
-{
+/** NRF Default function */
+static void nrf_qwr_error_handler(uint32_t nrf_error) {
     APP_ERROR_HANDLER(nrf_error);
 }
 
+/**@brief Handling receiving data from BLE */
 static void nus_data_handler(ble_nus_evt_t * p_evt) {
+    uint32_t err_code;
     if (p_evt->type == BLE_NUS_EVT_RX_DATA) {
         char * data_char = (char *) p_evt->params.rx_data.p_data;
-        timestamp = atoi(data_char);
+        switch (data_char[0]) {
+          case 'T': 
+              data_char = remove_first_char(data_char);
+              timestamp = atoi(data_char);
 
-        fds_record_desc_t desc = {0};
-        fds_find_token_t  tok  = {0};
+              fds_record_desc_t desc = {0};
+              fds_find_token_t  tok  = {0};
 
-        ret_code_t rc = fds_record_find(CONFIG_FILE, CONFIG_REC_KEY, &desc, &tok);
+              ret_code_t rc = fds_record_find(CONFIG_FILE, CONFIG_REC_KEY, &desc, &tok);
 
-        if (rc == FDS_SUCCESS) {
-            fds_flash_record_t config = {0};
+              if (rc == FDS_SUCCESS) {
+                  fds_flash_record_t config = {0};
 
-            rc = fds_record_open(&desc, &config);
-            APP_ERROR_CHECK(rc);
+                  rc = fds_record_open(&desc, &config);
+                  APP_ERROR_CHECK(rc);
 
-            memcpy(&m_dummy_cfg, config.p_data, sizeof(configuration_t));
+                  memcpy(&m_dummy_cfg, config.p_data, sizeof(configuration_t));
 
-            printf("Timestamp received, updating Timestamp to \t0x%04x\n", timestamp);
-            m_dummy_cfg.timestamp = timestamp;
+                  printf("Updating Timestamp to \t0x%04x\n", timestamp);
+                  m_dummy_cfg.timestamp = timestamp;
 
-            rc = fds_record_close(&desc);
-            APP_ERROR_CHECK(rc);
+                  rc = fds_record_close(&desc);
+                  APP_ERROR_CHECK(rc);
 
-            rc = fds_record_update(&desc, &m_dummy_record);
-            APP_ERROR_CHECK(rc);
+                  rc = fds_record_update(&desc, &m_dummy_record);
+                  APP_ERROR_CHECK(rc);
 
-            unsigned char data_arr[] = "Timestamp recieved, updating config file";
-            send_ble(data_arr);
-        } else {
-            printf("Timestamp was not found\n");
+                  send_ble("Timestamp recieved, updating config record");
+              } else {
+                  printf("Timestamp was not found\n");
+              }
+              break;
+          case 'D':   /**Set delay */
+              data_char = remove_first_char(data_char);
+              delay = atoi(data_char);
+              break;
+              
+          case 'A':   /**BLE send all data */
+              {
+                  int records_found = 0;
+
+                  fds_record_desc_t desc = {0};
+                  fds_find_token_t  tok  = {0};
+                  while (fds_record_iterate(&desc, &tok) != FDS_ERR_NOT_FOUND) {
+
+                      fds_flash_record_t record = {0};
+                      ret_code_t rc = fds_record_open(&desc, &record);
+
+                      if (rc == FDS_SUCCESS && record.p_header->record_key != CONFIG_REC_KEY) {
+                          records_found++;
+                          configuration_t * p_cfg = (configuration_t *)(record.p_data); 
+                          //printf("KEY:\t0x%04x \n", record.p_header->record_key);
+                         
+                          unsigned char time_string[] = "";
+                          itoa(p_cfg->timestamp, time_string, 10);
+                          err_code = send_ble(time_string);
+                          APP_ERROR_CHECK(err_code);
+
+                          unsigned char data1[] = "";
+                          itoa(p_cfg->data1, data1, 10);
+                          err_code = send_ble(data1);
+                          APP_ERROR_CHECK(err_code);
+                          //nrf_delay_ms(50);
+
+                          rc = fds_record_close(&desc);
+                          APP_ERROR_CHECK(rc); 
+                      } else {
+                          continue;
+                      }
+                  }
+                  printf("%d found records\n", records_found);
+
+                  if (!records_found) {
+                      char data_arr[] = "No saved data";
+                      err_code = send_ble(data_arr);
+                  }
+              }
+              break;
+          default:
+              break;
         }
     }
 
 }
-
-static void services_init(void)
-{
+/** NRF Default function */
+static void services_init(void) {
     uint32_t           err_code;
     ble_nus_init_t     nus_init;
     nrf_ble_qwr_init_t qwr_init = {0};
 
     // Initialize Queued Write Module.
     qwr_init.error_handler = nrf_qwr_error_handler;
-
     err_code = nrf_ble_qwr_init(&m_qwr, &qwr_init);
     APP_ERROR_CHECK(err_code);
 
     // Initialize NUS.
     memset(&nus_init, 0, sizeof(nus_init));
-
     nus_init.data_handler = nus_data_handler;
 
     err_code = ble_nus_init(&m_nus, &nus_init);
     APP_ERROR_CHECK(err_code);
 }
-
+/** NRF Default function */
 static void on_conn_params_evt(ble_conn_params_evt_t * p_evt) {
     uint32_t err_code;
 
-    if (p_evt->evt_type == BLE_CONN_PARAMS_EVT_FAILED)
-    {
+    if (p_evt->evt_type == BLE_CONN_PARAMS_EVT_FAILED) {
         err_code = sd_ble_gap_disconnect(m_conn_handle, BLE_HCI_CONN_INTERVAL_UNACCEPTABLE);
         APP_ERROR_CHECK(err_code);
     }
 }
-
-
+/** NRF Default function */
 static void conn_params_error_handler(uint32_t nrf_error) {
     APP_ERROR_HANDLER(nrf_error);
 }
-
-
-/**@brief Function for initializing the Connection Parameters module.
- */
+/** NRF Default function */
 static void conn_params_init(void)
 {
     uint32_t               err_code;
@@ -409,39 +393,22 @@ static void conn_params_init(void)
     err_code = ble_conn_params_init(&cp_init);
     APP_ERROR_CHECK(err_code);
 }
-
-
-/**@brief Function for putting the chip into sleep mode.
- *
- * @note This function will not return.
- */
-static void sleep_mode_enter(void)
-{
+/** NRF Default function */
+static void sleep_mode_enter(void) {
     uint32_t err_code = bsp_indication_set(BSP_INDICATE_IDLE);
     APP_ERROR_CHECK(err_code);
-
     // Prepare wakeup buttons.
     err_code = bsp_btn_ble_sleep_mode_prepare();
     APP_ERROR_CHECK(err_code);
-
     // Go to system-off mode (this function will not return; wakeup will cause a reset).
     err_code = sd_power_system_off();
     APP_ERROR_CHECK(err_code);
 }
-
-
-/**@brief Function for handling advertising events.
- *
- * @details This function will be called for advertising events which are passed to the application.
- *
- * @param[in] ble_adv_evt  Advertising event.
- */
-static void on_adv_evt(ble_adv_evt_t ble_adv_evt)
-{
+/** NRF Default function */
+static void on_adv_evt(ble_adv_evt_t ble_adv_evt) {
     uint32_t err_code;
 
-    switch (ble_adv_evt)
-    {
+    switch (ble_adv_evt){
         case BLE_ADV_EVT_FAST:
             err_code = bsp_indication_set(BSP_INDICATE_ADVERTISING);
             APP_ERROR_CHECK(err_code);
@@ -453,14 +420,13 @@ static void on_adv_evt(ble_adv_evt_t ble_adv_evt)
             break;
     }
 }
-
+/** NRF Default function */
 static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context) {
     uint32_t err_code;
 
-    switch (p_ble_evt->header.evt_id)
-    {
+    switch (p_ble_evt->header.evt_id) {
         case BLE_GAP_EVT_CONNECTED:
-            NRF_LOG_INFO("Connected");
+            printf("Connected\n");
             err_code = bsp_indication_set(BSP_INDICATE_CONNECTED);
             APP_ERROR_CHECK(err_code);
             m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
@@ -474,8 +440,7 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context) {
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
             break;
 
-        case BLE_GAP_EVT_PHY_UPDATE_REQUEST:
-        {
+        case BLE_GAP_EVT_PHY_UPDATE_REQUEST: {
             NRF_LOG_DEBUG("PHY update request.");
             ble_gap_phys_t const phys =
             {
@@ -517,14 +482,8 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context) {
             break;
     }
 }
-
-
-/**@brief Function for the SoftDevice initialization.
- *
- * @details This function initializes the SoftDevice and the BLE event interrupt.
- */
-static void ble_stack_init(void)
-{
+/** NRF Default function */
+static void ble_stack_init(void) {
     ret_code_t err_code;
 
     err_code = nrf_sdh_enable_request();
@@ -543,9 +502,7 @@ static void ble_stack_init(void)
     // Register a handler for BLE events.
     NRF_SDH_BLE_OBSERVER(m_ble_observer, APP_BLE_OBSERVER_PRIO, ble_evt_handler, NULL);
 }
-
-
-/**@brief Function for handling events from the GATT library. */
+/** NRF Default function */
 void gatt_evt_handler(nrf_ble_gatt_t * p_gatt, nrf_ble_gatt_evt_t const * p_evt)
 {
     if ((m_conn_handle == p_evt->conn_handle) && (p_evt->evt_id == NRF_BLE_GATT_EVT_ATT_MTU_UPDATED))
@@ -557,9 +514,7 @@ void gatt_evt_handler(nrf_ble_gatt_t * p_gatt, nrf_ble_gatt_evt_t const * p_evt)
                   p_gatt->att_mtu_desired_central,
                   p_gatt->att_mtu_desired_periph);
 }
-
-
-/**@brief Function for initializing the GATT library. */
+/** NRF Default function */
 void gatt_init(void)
 {
     ret_code_t err_code;
@@ -570,12 +525,7 @@ void gatt_init(void)
     err_code = nrf_ble_gatt_att_mtu_periph_set(&m_gatt, NRF_SDH_BLE_GATT_MAX_MTU_SIZE);
     APP_ERROR_CHECK(err_code);
 }
-
-
-/**@brief Function for handling events from the BSP module.
- *
- * @param[in]   event   Event generated by button press.
- */
+/** NRF Default function */
 void bsp_event_handler(bsp_event_t event) {
     uint32_t err_code;
     switch (event) {
@@ -608,8 +558,12 @@ configuration_t newDataInFile (uint32_t timestamp,
   configuration_t data =
 {
     .timestamp = timestamp,
+    .sign_active_power = 0x0,
+    .sign_reactive_power = 0x0,
+    .overflow_active_energy = 0x0,
+    .overflow_reactive_energy = 0x0,
     .data1 = data1,
-    .crc = 0x0, //crc32_compute(
+    .crc = 0x0, //crc16_compute(
 };
   return data;
 }
@@ -624,43 +578,46 @@ void static write_fds (void const * p_data) {
         .data.length_words = (sizeof(configuration_t) + 3) / sizeof(uint32_t),
     };
   if (key != FDS_RECORD_KEY_DIRTY && fileID != FDS_FILE_ID_INVALID) {
-    configuration_t * p_cfg = (configuration_t *)(p_data);
-    printf("W Key:\t0x%04x,data:\t0x%04x T:\t0x%04x, 1:\t0x%04x, c:\t0x%04x\n\n", key, &rec.data.p_data, p_cfg->timestamp, p_cfg->data1, p_cfg->crc);
-    ret_code_t rc = fds_record_write(&desc, &rec);
-    APP_ERROR_CHECK(rc);
+      configuration_t * p_cfg = (configuration_t *)(p_data);
+      ret_code_t rc = fds_record_write(&desc, &rec);
+      APP_ERROR_CHECK(rc);
 
-    if (rc != FDS_SUCCESS){
-      bsp_board_led_on(BSP_BOARD_LED_3);
-    } else {
-      key++;
-    }
+      if (rc != FDS_SUCCESS){
+          bsp_board_led_on(BSP_BOARD_LED_3);
+      } else {
+          printf("WRITE COMPLETE - KEY:%d\n", key);
+          key++;
+      }
   }
 
 }
-//######################################################################################################### get_data from FDS
-void get_all_data(uint16_t file_id) {
+//######################################################################################################### print all data from FDS
+void print_all_data() {
+    int records_found = 0;
     fds_record_desc_t desc = {0};
     fds_find_token_t  tok  = {0};
-    printf("FOUND\n");
+    printf("PRINT FOUND\n");
     while (fds_record_iterate(&desc, &tok) != FDS_ERR_NOT_FOUND) {
 
         fds_flash_record_t record = {0};
         ret_code_t rc = fds_record_open(&desc, &record);
 
-        if (rc == FDS_SUCCESS){
-
-          configuration_t * p_cfg = (configuration_t *)(record.p_data);
-          uint32_t const len = record.p_header->length_words * sizeof(uint32_t);
-          printf("KEY:\t0x%04x DATA:\t0x%04x T:\t0x%04x, 1:\t0x%04x, c:\t0x%04x\n\n",
-          record.p_header->record_key,record.p_data, p_cfg->timestamp, p_cfg->data1, p_cfg->crc);
+        if (rc == FDS_SUCCESS) {
+            records_found++;
+            configuration_t * p_cfg = (configuration_t *)(record.p_data);
+            printf("KEY:\t0x%04x DATA:\t0x%04x T:\t0x%04x, 1:\t0x%04x, c:\t0x%04x\n\n",
+            record.p_header->record_key,record.p_data, p_cfg->timestamp, p_cfg->data1, p_cfg->crc);
        
-          rc = fds_record_close(&desc);
-          APP_ERROR_CHECK(rc);
-          p_cfg = NULL;
-          nrf_delay_ms(50);
+            nrf_delay_ms(50);
+            rc = fds_record_close(&desc);
+            APP_ERROR_CHECK(rc);
+        } else {
+            continue;
         }
     }
+    printf("%d found records\n", records_found);
 }
+
 //######################################################################################################################### UART SEND
 void uart_event_handle(app_uart_evt_t * p_event) {
     static uint8_t send_array[BLE_NUS_MAX_DATA_LEN];
@@ -682,15 +639,18 @@ void uart_event_handle(app_uart_evt_t * p_event) {
 
                     configuration_t newData = newDataInFile(timestamp, num);
                     write_fds(&newData);
-                    get_all_data(fileID);
 
-                    uint32_t data1 = newData.data1;
-                    sprintf(data_arr, "%d", data1);
+                    print_all_data();
+                    sprintf(data_arr, "%d", newData.data1);
                   } else {
                     strcpy(data_arr,"No timestamp");
                   }
+                  //do {
+                      err_code = send_ble(data_arr);
+                      timestamp += delay;
+                      //nrf_delay_ms(1000 * delay); 
+                  //} while (delay);
 
-                  err_code = send_ble(data_arr);
                 } while (err_code == NRF_ERROR_RESOURCES);
               }
               index = 0;
@@ -709,7 +669,38 @@ void uart_event_handle(app_uart_evt_t * p_event) {
             break;
     }
 }
+//######################################################################################################### handling SPI
+void spi_event_handler(nrf_drv_spi_evt_t const * p_event,
+                       void *                    p_context) {
+    spi_xfer_done = true;
+    printf("Transfer:\t0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n",m_tx_buf[0],m_tx_buf[1],m_tx_buf[2],m_tx_buf[3],m_tx_buf[4]);
+    if (m_rx_buf[0] != 0) {
+        printf("Received:\t0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n",m_rx_buf[0],m_rx_buf[1],m_rx_buf[2],m_rx_buf[3],m_rx_buf[4]);
+        uint8_t  data[] = {0, 0, 0, 0};
+        mirror_data(m_rx_buf, sizeof(m_rx_buf), data);
+        for (int i = 0; i< sizeof(data); i++) {
+            printf("0x%02x ",data[i]);
+        }
+        printf("\n");
+    }
+}
 
+static void read_spi_data() {
+    for(uint8_t i = 0x00; i <= 0x04; i +=2 ) {
+        memset(m_rx_buf, 0, m_length);
+        spi_xfer_done = false;
+        uint8_t buff[] = {i,0xFF,0xFF,0xFF};
+        m_tx_buf[0] = i;
+        m_tx_buf[4] = crc8(buff, sizeof(buff));
+        APP_ERROR_CHECK(nrf_drv_spi_transfer(&spi, m_tx_buf, m_length, m_rx_buf, m_length));
+        while (!spi_xfer_done) {
+                __WFE();
+        }
+        nrf_delay_ms(50);
+   }
+   nrf_delay_ms(60*1000);
+}
+/** NRF Default function */
 static void uart_init(void) {
     uint32_t                     err_code;
     app_uart_comm_params_t const comm_params =
@@ -735,11 +726,7 @@ static void uart_init(void) {
                        err_code);
     APP_ERROR_CHECK(err_code);
 }
-/**@snippet [UART Initialization] */
-
-
-/**@brief Function for initializing the Advertising functionality.
- */
+/** NRF Default function */
 static void advertising_init(void) {
     uint32_t               err_code;
     ble_advertising_init_t init;
@@ -763,12 +750,7 @@ static void advertising_init(void) {
 
     ble_advertising_conn_cfg_tag_set(&m_advertising, APP_BLE_CONN_CFG_TAG);
 }
-
-
-/**@brief Function for initializing buttons and leds.
- *
- * @param[out] p_erase_bonds  Will be true if the clear bonding button was pressed to wake the application up.
- */
+/** NRF Default function */
 static void buttons_leds_init(bool * p_erase_bonds) {
     bsp_event_t startup_event;
 
@@ -780,53 +762,33 @@ static void buttons_leds_init(bool * p_erase_bonds) {
 
     *p_erase_bonds = (startup_event == BSP_EVENT_CLEAR_BONDING_DATA);
 }
-
-
-/**@brief Function for initializing the nrf log module.
- */
-static void log_init(void)
-{
+/** NRF Default function */
+static void log_init(void) {
     ret_code_t err_code = NRF_LOG_INIT(NULL);
     APP_ERROR_CHECK(err_code);
 
     NRF_LOG_DEFAULT_BACKENDS_INIT();
 }
-
-
-/**@brief Function for initializing power management.
- */
-static void power_management_init(void)
-{
+/** NRF Default function */
+static void power_management_init(void) {
     ret_code_t err_code;
     err_code = nrf_pwr_mgmt_init();
     APP_ERROR_CHECK(err_code);
 }
-
-
-/**@brief Function for handling the idle state (main loop).
- *
- * @details If there is no pending log operation, then sleep until next the next event occurs.
- */
-static void idle_state_handle(void)
-{
+/** NRF Default function */
+static void idle_state_handle(void) {
     UNUSED_RETURN_VALUE(NRF_LOG_PROCESS());
     nrf_pwr_mgmt_run();
 }
-
-
-/**@brief Function for starting advertising.
- */
-static void advertising_start(void)
-{
+/** NRF Default function */
+static void advertising_start(void) {
     uint32_t err_code = ble_advertising_start(&m_advertising, BLE_ADV_MODE_FAST);
     APP_ERROR_CHECK(err_code);
 }
 
-
 /**@brief Application main function.
  */
-int main(void)
-{
+int main(void) {
     bool erase_bonds;
     ret_code_t rc;
 
@@ -842,6 +804,14 @@ int main(void)
     services_init();
     advertising_init();
     conn_params_init();
+
+    nrf_drv_spi_config_t spi_config = NRF_DRV_SPI_DEFAULT_CONFIG;
+    spi_config.ss_pin   = SPI_SS_PIN;
+    spi_config.miso_pin = SPI_MISO_PIN;
+    spi_config.mosi_pin = SPI_MOSI_PIN;
+    spi_config.sck_pin  = SPI_SCK_PIN;
+    spi_config.mode = NRF_SPI_MODE_3;
+    APP_ERROR_CHECK(nrf_drv_spi_init(&spi, &spi_config, spi_event_handler, NULL));
 
     printf("\n");
     (void) fds_register(fds_evt_handler);
@@ -870,7 +840,7 @@ int main(void)
     fds_record_desc_t desc = {0};
     fds_find_token_t  tok  = {0};
 
-    get_all_data(fileID);
+    print_all_data();
 
     if (fds_record_find(CONFIG_FILE, CONFIG_REC_KEY, &desc, &tok) == FDS_SUCCESS) {
         fds_flash_record_t config = {0};
@@ -893,6 +863,7 @@ int main(void)
     advertising_start();
 
     for (;;) {
+        read_spi_data();
         idle_state_handle();
     }
 }

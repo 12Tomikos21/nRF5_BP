@@ -12,6 +12,10 @@
 typedef struct
 {
     uint32_t timestamp;
+    uint32_t sign_active_power;
+    uint32_t sign_reactive_power;
+    uint32_t overflow_active_energy;
+    uint32_t overflow_reactive_energy;
     uint32_t data1;
     uint32_t crc;
 } configuration_t;
