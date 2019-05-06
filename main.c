@@ -53,7 +53,6 @@
 
 #define APP_BLE_OBSERVER_PRIO           3                                           /**< Application's BLE observer priority. You shouldn't need to modify this value. */
 #define APP_ADV_INTERVAL                64                                          /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
-
 #define APP_ADV_DURATION                18000                                       /**< The advertising duration (180 seconds) in units of 10 milliseconds. */
 
 #define MIN_CONN_INTERVAL               MSEC_TO_UNITS(20, UNIT_1_25_MS)             /**< Minimum acceptable connection interval (20 ms), Connection interval uses 1.25 ms units. */
@@ -90,6 +89,11 @@ static uint8_t       m_tx_buf[] = {0x00,0xFF,0xFF,0xFF,0xFF};                   
 static uint8_t       m_rx_buf[sizeof(m_tx_buf)];                                  /**< RX buffer. */
 static const uint8_t m_length = sizeof(m_tx_buf);                                   /**< Transfer length. */
 
+static uint8_t      stpm_data[] = {
+    RMS_DATA, PERIOD, PHASE_ANGLE, ACTIVE_POWER, FUND_POWER, REACTIVE_POWER, RMS_POWER, APPARENT_POWER
+};
+
+bool read_actual = false;
 //######################################################################################################### FDS
 static bool volatile m_fds_initialized;
 static struct
@@ -106,8 +110,7 @@ static void fds_evt_handler(fds_evt_t const * p_evt) {
             }
             break;
 
-        case FDS_EVT_WRITE:
-        {
+        case FDS_EVT_WRITE: {
             if (p_evt->result == FDS_SUCCESS) {
                 NRF_LOG_INFO("Record ID:\t0x%04x\n",  p_evt->write.record_id);
                 NRF_LOG_INFO("File ID:\t0x%04x\n",    p_evt->write.file_id);
@@ -115,8 +118,7 @@ static void fds_evt_handler(fds_evt_t const * p_evt) {
             }
         } break;
 
-        case FDS_EVT_DEL_RECORD:
-        {
+        case FDS_EVT_DEL_RECORD: {
             if (p_evt->result == FDS_SUCCESS) {
                 NRF_LOG_INFO("Record ID:\t0x%04x",  p_evt->del.record_id);
                 NRF_LOG_INFO("File ID:\t0x%04x",    p_evt->del.file_id);
@@ -171,13 +173,16 @@ void delete_all_process(void){
 //######################################################################################################### set config file
 static configuration_t m_dummy_cfg =
 {
-    .timestamp = 0x0,
-    .sign_active_power = 0x0,
-    .sign_reactive_power = 0x0,
-    .overflow_active_energy = 0x0,
-    .overflow_reactive_energy = 0x0,
-    .data1 = 0x55,
-    .crc = 0x11,
+    .timestamp      = 0x0,
+    .period         = 0x0,
+    .rms_data       = 0x0,
+    .phase_angle    = 0x0,
+    .active_power   = 0x0,
+    .fund_power     = 0x0,
+    .reactive_power = 0x0,
+    .rms_power      = 0x0,
+    .apparent_power = 0x0,
+    .crc            = 0x0,
 };
 
 static fds_record_t const m_dummy_record =
@@ -189,13 +194,13 @@ static fds_record_t const m_dummy_record =
 };
 //######################################################################################################### init fileID and key
 /**@brief timestamp for data, by default start at 0 */
-uint32_t timestamp = 0;
+uint32_t timestamp  = 0;
 /**@brief fileID for NFS, by default start at 1 */
-uint16_t fileID = 0x01;
+uint16_t fileID     = 0x01;
 /**@brief Key for NFS, by default start at 1 */
-uint16_t key = 0x01;
+uint16_t key        = 0x01;
 /**@brief Delay of reading data, by default is 5 seconds */
-int delay = 5; 
+uint8_t delay           = 5; 
 
 bool delete_all_data = false;
 //######################################################################################################### send data
@@ -212,8 +217,14 @@ uint32_t send_ble(unsigned char data_arr[]) {
             APP_ERROR_CHECK(err_code);
         }
     } while (err_code == NRF_ERROR_BUSY);
-    printf("%s - sended\n",data_arr);
+    nrf_delay_ms(500);
     return err_code;
+}
+/**@brief Function for sending integers from BLE */
+uint32_t send_ble_uint32(uint32_t data){
+    unsigned char send_string[] = "00000000";
+    sprintf(send_string, "%d", data);
+    return send_ble(send_string);
 }
 /** NRF Default function */
 void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name) {
@@ -252,90 +263,124 @@ static void gap_params_init(void) {
 static void nrf_qwr_error_handler(uint32_t nrf_error) {
     APP_ERROR_HANDLER(nrf_error);
 }
+//######################################################################################################### handling SPI
+void spi_event_handler(nrf_drv_spi_evt_t const * p_event,
+                       void *                    p_context) {
+    spi_xfer_done = true;
+}
 
+static void read_spi_data() {
+    for(uint8_t i = 0; i < sizeof(stpm_data); i++ ) {
+        memset(m_rx_buf, 0, m_length);
+        spi_xfer_done = false;
+        uint8_t buff[] = {stpm_data[i],0xFF,0xFF,0xFF};
+        m_tx_buf[0] = stpm_data[i];
+        m_tx_buf[4] = crc8(buff, sizeof(buff));
+        APP_ERROR_CHECK(nrf_drv_spi_transfer(&spi, m_tx_buf, m_length, m_rx_buf, m_length));
+        while (!spi_xfer_done) {
+                __WFE();
+        }
+        nrf_delay_ms(50);
+   }
+   nrf_delay_ms(60*1000);
+}
+void read_and_send_actual_data() {
+    for(uint8_t i = 0; i < sizeof(stpm_data); i++ ) {
+        memset(m_rx_buf, 0, m_length);
+        spi_xfer_done = false;
+
+        uint8_t buff[] = {stpm_data[i],0xFF,0xFF,0xFF};
+        m_tx_buf[0] = stpm_data[i];
+        m_tx_buf[4] = crc8(buff, sizeof(buff));
+        APP_ERROR_CHECK(nrf_drv_spi_transfer(&spi, m_tx_buf, m_length, m_rx_buf, m_length));
+        while (!spi_xfer_done) 
+        printf("Transfer:\t0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n",m_tx_buf[0],m_tx_buf[1],m_tx_buf[2],m_tx_buf[3],m_tx_buf[4]);
+        uint8_t  data[] = {0, 0, 0, 0};
+        mirror_data(m_rx_buf, sizeof(m_rx_buf), data);
+        uint32_t data32 = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+        printf("0x%08x\n",data32);
+        unsigned char send_string[] = "00000000";
+        sprintf(send_string, "%d", data32);
+        send_ble(send_string);
+    }
+    read_actual = false;
+}
 /**@brief Handling receiving data from BLE */
 static void nus_data_handler(ble_nus_evt_t * p_evt) {
     uint32_t err_code;
     if (p_evt->type == BLE_NUS_EVT_RX_DATA) {
+
         char * data_char = (char *) p_evt->params.rx_data.p_data;
         switch (data_char[0]) {
-          case 'T': 
-              data_char = remove_first_char(data_char);
-              timestamp = atoi(data_char);
+            case 'T': 
+                data_char = remove_first_char(data_char);
+                timestamp = atoi(data_char);
 
-              fds_record_desc_t desc = {0};
-              fds_find_token_t  tok  = {0};
+                fds_record_desc_t desc = {0};
+                fds_find_token_t  tok  = {0};
 
-              ret_code_t rc = fds_record_find(CONFIG_FILE, CONFIG_REC_KEY, &desc, &tok);
+                ret_code_t rc = fds_record_find(CONFIG_FILE, CONFIG_REC_KEY, &desc, &tok);
 
-              if (rc == FDS_SUCCESS) {
-                  fds_flash_record_t config = {0};
+                if (rc == FDS_SUCCESS) {
+                    fds_flash_record_t config = {0};
+                    rc = fds_record_open(&desc, &config);
+                    APP_ERROR_CHECK(rc);
 
-                  rc = fds_record_open(&desc, &config);
-                  APP_ERROR_CHECK(rc);
+                    memcpy(&m_dummy_cfg, config.p_data, sizeof(configuration_t));
+                    printf("Updating Timestamp to \t0x%04x\n", timestamp);
+                    m_dummy_cfg.timestamp = timestamp;
 
-                  memcpy(&m_dummy_cfg, config.p_data, sizeof(configuration_t));
+                    rc = fds_record_close(&desc);
+                    APP_ERROR_CHECK(rc);
 
-                  printf("Updating Timestamp to \t0x%04x\n", timestamp);
-                  m_dummy_cfg.timestamp = timestamp;
-
-                  rc = fds_record_close(&desc);
-                  APP_ERROR_CHECK(rc);
-
-                  rc = fds_record_update(&desc, &m_dummy_record);
-                  APP_ERROR_CHECK(rc);
-
-                  send_ble("Timestamp recieved, updating config record");
-              } else {
-                  printf("Timestamp was not found\n");
-              }
-              break;
-          case 'D':   /**Set delay */
-              data_char = remove_first_char(data_char);
-              delay = atoi(data_char);
-              break;
+                    rc = fds_record_update(&desc, &m_dummy_record);
+                    APP_ERROR_CHECK(rc);
+                    send_ble("Timestamp recieved, updating config record");
+                } else {
+                    printf("Timestamp was not found\n");
+                    send_ble("Timestamp was not found");
+                }
+                break;
+            case 'D':     /**Set delay */
+                data_char = remove_first_char(data_char);
+                delay = atoi(data_char);
+                break;
               
-          case 'A':   /**BLE send all data */
+            case 'H': {   /**BLE send all historic data */
+                fds_record_desc_t desc = {0};
+                fds_find_token_t  tok  = {0};
+                while (fds_record_iterate(&desc, &tok) != FDS_ERR_NOT_FOUND) {
+
+                    fds_flash_record_t record = {0};
+                    ret_code_t rc = fds_record_open(&desc, &record);
+                    printf("KEY:\t0x%04x \n", record.p_header->record_key);  
+                    if (rc == FDS_SUCCESS && record.p_header->record_key != CONFIG_REC_KEY) {
+                        configuration_t * p_cfg = (configuration_t *)(record.p_data); 
+                        
+                        err_code = send_ble("Time:");
+                        send_ble_uint32(p_cfg->timestamp);
+                        send_ble_uint32(p_cfg->period);
+                        send_ble_uint32(p_cfg->rms_data);
+                        send_ble_uint32(p_cfg->phase_angle);
+                        send_ble_uint32(p_cfg->active_power);
+                        send_ble_uint32(p_cfg->fund_power);
+                        send_ble_uint32(p_cfg->reactive_power);
+                        send_ble_uint32(p_cfg->rms_power);
+                        send_ble_uint32(p_cfg->apparent_power);
+                        send_ble_uint32(p_cfg->crc);
+
+                        rc = fds_record_close(&desc);
+                        APP_ERROR_CHECK(rc); 
+                    } else {
+                        continue;
+                    }
+                }
+            }   break;
+            case 'A':   /**BLE send actual data */
               {
-                  int records_found = 0;
-
-                  fds_record_desc_t desc = {0};
-                  fds_find_token_t  tok  = {0};
-                  while (fds_record_iterate(&desc, &tok) != FDS_ERR_NOT_FOUND) {
-
-                      fds_flash_record_t record = {0};
-                      ret_code_t rc = fds_record_open(&desc, &record);
-
-                      if (rc == FDS_SUCCESS && record.p_header->record_key != CONFIG_REC_KEY) {
-                          records_found++;
-                          configuration_t * p_cfg = (configuration_t *)(record.p_data); 
-                          //printf("KEY:\t0x%04x \n", record.p_header->record_key);
-                         
-                          unsigned char time_string[] = "";
-                          itoa(p_cfg->timestamp, time_string, 10);
-                          err_code = send_ble(time_string);
-                          APP_ERROR_CHECK(err_code);
-
-                          unsigned char data1[] = "";
-                          itoa(p_cfg->data1, data1, 10);
-                          err_code = send_ble(data1);
-                          APP_ERROR_CHECK(err_code);
-                          //nrf_delay_ms(50);
-
-                          rc = fds_record_close(&desc);
-                          APP_ERROR_CHECK(rc); 
-                      } else {
-                          continue;
-                      }
-                  }
-                  printf("%d found records\n", records_found);
-
-                  if (!records_found) {
-                      char data_arr[] = "No saved data";
-                      err_code = send_ble(data_arr);
-                  }
+                read_actual = true;
               }
-              break;
+                break;
           default:
               break;
         }
@@ -508,7 +553,7 @@ void gatt_evt_handler(nrf_ble_gatt_t * p_gatt, nrf_ble_gatt_evt_t const * p_evt)
     if ((m_conn_handle == p_evt->conn_handle) && (p_evt->evt_id == NRF_BLE_GATT_EVT_ATT_MTU_UPDATED))
     {
         m_ble_nus_max_data_len = p_evt->params.att_mtu_effective - OPCODE_LENGTH - HANDLE_LENGTH;
-        NRF_LOG_INFO("Data len is set to 0x%X(%d)", m_ble_nus_max_data_len, m_ble_nus_max_data_len);
+        printf("Data len is set to 0x%X(%d)\n", m_ble_nus_max_data_len, m_ble_nus_max_data_len);
     }
     NRF_LOG_DEBUG("ATT MTU exchange completed. central 0x%x peripheral 0x%x",
                   p_gatt->att_mtu_desired_central,
@@ -558,12 +603,15 @@ configuration_t newDataInFile (uint32_t timestamp,
   configuration_t data =
 {
     .timestamp = timestamp,
-    .sign_active_power = 0x0,
-    .sign_reactive_power = 0x0,
-    .overflow_active_energy = 0x0,
-    .overflow_reactive_energy = 0x0,
-    .data1 = data1,
-    .crc = 0x0, //crc16_compute(
+    .period = data1,
+    .rms_data = 0x0,
+    .phase_angle = 0x0,
+    .active_power = 0x0,
+    .fund_power = 0x0,
+    .reactive_power = 0x0,
+    .rms_power = 0x0,
+    .apparent_power = 0x0,
+    .crc = 0x0,
 };
   return data;
 }
@@ -589,7 +637,6 @@ void static write_fds (void const * p_data) {
           key++;
       }
   }
-
 }
 //######################################################################################################### print all data from FDS
 void print_all_data() {
@@ -598,15 +645,14 @@ void print_all_data() {
     fds_find_token_t  tok  = {0};
     printf("PRINT FOUND\n");
     while (fds_record_iterate(&desc, &tok) != FDS_ERR_NOT_FOUND) {
-
         fds_flash_record_t record = {0};
         ret_code_t rc = fds_record_open(&desc, &record);
 
         if (rc == FDS_SUCCESS) {
             records_found++;
             configuration_t * p_cfg = (configuration_t *)(record.p_data);
-            printf("KEY:\t0x%04x DATA:\t0x%04x T:\t0x%04x, 1:\t0x%04x, c:\t0x%04x\n\n",
-            record.p_header->record_key,record.p_data, p_cfg->timestamp, p_cfg->data1, p_cfg->crc);
+            printf("KEY:\t0x%04x T:\t0x%04x, 1:\t0x%04x, c:\t0x%04x\n",
+            record.p_header->record_key, p_cfg->timestamp, p_cfg->period, p_cfg->crc);
        
             nrf_delay_ms(50);
             rc = fds_record_close(&desc);
@@ -630,30 +676,26 @@ void uart_event_handle(app_uart_evt_t * p_event) {
             index++;
  
             if ((send_array[index - 1] == '\n') || (index >= m_ble_nus_max_data_len)) {
-              if (index > 1) {
-                do {
-                  if (timestamp != 0) {
-                    send_array[--index] = 0;
-                    char * num_char = (char *) send_array;
-                    uint32_t  num = atoi(num_char);
+                if (index > 1) {
+                    do {
+                        if (timestamp != 0) {
+                            send_array[--index] = 0;
+                            char * num_char = (char *) send_array;
+                            uint32_t  num = atoi(num_char);
+                            configuration_t newData = newDataInFile(timestamp, num);
+                            write_fds(&newData);
 
-                    configuration_t newData = newDataInFile(timestamp, num);
-                    write_fds(&newData);
+                            print_all_data();
+                            sprintf(data_arr, "%d", newData.period);
+                        } else {
+                          strcpy(data_arr,"No timestamp");
+                        }
+                        err_code = send_ble(data_arr);
+                        timestamp += delay;
 
-                    print_all_data();
-                    sprintf(data_arr, "%d", newData.data1);
-                  } else {
-                    strcpy(data_arr,"No timestamp");
-                  }
-                  //do {
-                      err_code = send_ble(data_arr);
-                      timestamp += delay;
-                      //nrf_delay_ms(1000 * delay); 
-                  //} while (delay);
-
-                } while (err_code == NRF_ERROR_RESOURCES);
-              }
-              index = 0;
+                    } while (err_code == NRF_ERROR_RESOURCES);
+                }
+                index = 0;
             }
             break;
 
@@ -669,42 +711,11 @@ void uart_event_handle(app_uart_evt_t * p_event) {
             break;
     }
 }
-//######################################################################################################### handling SPI
-void spi_event_handler(nrf_drv_spi_evt_t const * p_event,
-                       void *                    p_context) {
-    spi_xfer_done = true;
-    printf("Transfer:\t0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n",m_tx_buf[0],m_tx_buf[1],m_tx_buf[2],m_tx_buf[3],m_tx_buf[4]);
-    if (m_rx_buf[0] != 0) {
-        printf("Received:\t0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n",m_rx_buf[0],m_rx_buf[1],m_rx_buf[2],m_rx_buf[3],m_rx_buf[4]);
-        uint8_t  data[] = {0, 0, 0, 0};
-        mirror_data(m_rx_buf, sizeof(m_rx_buf), data);
-        for (int i = 0; i< sizeof(data); i++) {
-            printf("0x%02x ",data[i]);
-        }
-        printf("\n");
-    }
-}
 
-static void read_spi_data() {
-    for(uint8_t i = 0x00; i <= 0x04; i +=2 ) {
-        memset(m_rx_buf, 0, m_length);
-        spi_xfer_done = false;
-        uint8_t buff[] = {i,0xFF,0xFF,0xFF};
-        m_tx_buf[0] = i;
-        m_tx_buf[4] = crc8(buff, sizeof(buff));
-        APP_ERROR_CHECK(nrf_drv_spi_transfer(&spi, m_tx_buf, m_length, m_rx_buf, m_length));
-        while (!spi_xfer_done) {
-                __WFE();
-        }
-        nrf_delay_ms(50);
-   }
-   nrf_delay_ms(60*1000);
-}
 /** NRF Default function */
 static void uart_init(void) {
     uint32_t                     err_code;
-    app_uart_comm_params_t const comm_params =
-    {
+    app_uart_comm_params_t const comm_params = {
         .rx_pin_no    = RX_PIN_NUMBER,
         .tx_pin_no    = TX_PIN_NUMBER,
         .rts_pin_no   = RTS_PIN_NUMBER,
@@ -813,7 +824,7 @@ int main(void) {
     spi_config.mode = NRF_SPI_MODE_3;
     APP_ERROR_CHECK(nrf_drv_spi_init(&spi, &spi_config, spi_event_handler, NULL));
 
-    printf("\n");
+    printf("\n################FEI_PROJECT################\n");
     (void) fds_register(fds_evt_handler);
     rc = fds_init();
     APP_ERROR_CHECK(rc);
@@ -828,10 +839,7 @@ int main(void) {
     fds_stat_t stat = {0};
     rc = fds_stat(&stat);
     APP_ERROR_CHECK(rc);
-
     printf("Found %d valid records\n", stat.valid_records);
-    //printf("Found %d dirty records\n", stat.dirty_records);
-
     if (stat.dirty_records > 0)
       fds_gc();
     
@@ -862,9 +870,12 @@ int main(void) {
     }
     advertising_start();
 
-    for (;;) {
-        read_spi_data();
+    for (;;) {   
+        if (read_actual) {
+          read_and_send_actual_data();
+        }
         idle_state_handle();
+        
     }
 }
 
